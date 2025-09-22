@@ -13,12 +13,19 @@
 (define-constant ERR-INVALID-STATUS (err u106))
 (define-constant ERR-CONSULTATION-EXPIRED (err u107))
 (define-constant ERR-DISPUTE-EXISTS (err u108))
+(define-constant ERR-INVALID-RATING (err u109))
+(define-constant ERR-ALREADY-RATED (err u110))
+(define-constant ERR-NOT-PATIENT (err u111))
+(define-constant ERR-NOT-COMPLETED (err u112))
 
 ;; Constants
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant PLATFORM-FEE-PERCENT u3)
 (define-constant CONSULTATION-TIMEOUT-BLOCKS u144)
 (define-constant DISPUTE-RESOLUTION-BLOCKS u1008)
+(define-constant MIN-RATING u1)
+(define-constant MAX-RATING u5)
+(define-constant RATING-SCALE u100)
 
 ;; Data Variables
 (define-data-var total-consultations uint u0)
@@ -74,6 +81,18 @@
     available: bool,
     next-available-block: uint,
     consultation-duration-blocks: uint
+})
+
+(define-map doctor-ratings principal {
+    total-score: uint,
+    rating-count: uint,
+    average-rating: uint
+})
+
+(define-map consultation-ratings uint {
+    rated: bool,
+    rating: uint,
+    rated-at-block: uint
 })
 
 ;; Public Functions
@@ -289,6 +308,39 @@
     )
 )
 
+(define-public (submit-rating (consultation-id uint) (rating uint))
+    (let (
+        (consultation (unwrap! (map-get? consultations consultation-id) ERR-NOT-FOUND))
+        (patient (get patient consultation))
+        (doctor (get doctor consultation))
+        (consultation-rating (map-get? consultation-ratings consultation-id))
+        (current-doctor-rating (default-to { total-score: u0, rating-count: u0, average-rating: u0 } 
+                                           (map-get? doctor-ratings doctor)))
+        (new-total-score (+ (get total-score current-doctor-rating) rating))
+        (new-rating-count (+ (get rating-count current-doctor-rating) u1))
+        (new-average-rating (/ (* new-total-score RATING-SCALE) new-rating-count))
+    )
+        (asserts! (is-eq tx-sender patient) ERR-NOT-PATIENT)
+        (asserts! (is-eq (get status consultation) "completed") ERR-NOT-COMPLETED)
+        (asserts! (and (>= rating MIN-RATING) (<= rating MAX-RATING)) ERR-INVALID-RATING)
+        (asserts! (is-none consultation-rating) ERR-ALREADY-RATED)
+        
+        (map-set consultation-ratings consultation-id {
+            rated: true,
+            rating: rating,
+            rated-at-block: stacks-block-height
+        })
+        
+        (map-set doctor-ratings doctor {
+            total-score: new-total-score,
+            rating-count: new-rating-count,
+            average-rating: new-average-rating
+        })
+        
+        (ok true)
+    )
+)
+
 ;; Read-only functions
 
 (define-read-only (get-doctor (doctor principal))
@@ -351,5 +403,44 @@
                 )
             none
         )
+    )
+)
+
+(define-read-only (get-doctor-rating (doctor principal))
+    (map-get? doctor-ratings doctor)
+)
+
+(define-read-only (get-consultation-rating (consultation-id uint))
+    (map-get? consultation-ratings consultation-id)
+)
+
+(define-read-only (has-consultation-been-rated (consultation-id uint))
+    (let (
+        (rating-data (map-get? consultation-ratings consultation-id))
+    )
+        (match rating-data
+            some-rating (get rated some-rating)
+            false
+        )
+    )
+)
+
+(define-read-only (get-doctor-average-rating (doctor principal))
+    (let (
+        (rating-data (map-get? doctor-ratings doctor))
+    )
+        (match rating-data
+            some-rating (get average-rating some-rating)
+            u0
+        )
+    )
+)
+
+(define-read-only (doctor-meets-min-rating (doctor principal) (min-rating uint))
+    (let (
+        (doctor-average (get-doctor-average-rating doctor))
+        (min-rating-scaled (* min-rating RATING-SCALE))
+    )
+        (>= doctor-average min-rating-scaled)
     )
 )
