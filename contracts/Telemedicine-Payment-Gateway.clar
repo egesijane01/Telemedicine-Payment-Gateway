@@ -17,6 +17,11 @@
 (define-constant ERR-ALREADY-RATED (err u110))
 (define-constant ERR-NOT-PATIENT (err u111))
 (define-constant ERR-NOT-COMPLETED (err u112))
+(define-constant ERR-SUBSCRIPTION-EXISTS (err u113))
+(define-constant ERR-SUBSCRIPTION-NOT-FOUND (err u114))
+(define-constant ERR-SUBSCRIPTION-INACTIVE (err u115))
+(define-constant ERR-INVALID-FREQUENCY (err u116))
+(define-constant ERR-PAYMENT-NOT-DUE (err u117))
 
 ;; Constants
 (define-constant CONTRACT-OWNER tx-sender)
@@ -31,6 +36,7 @@
 (define-data-var total-consultations uint u0)
 (define-data-var total-fees-collected uint u0)
 (define-data-var platform-paused bool false)
+(define-data-var total-subscriptions uint u0)
 
 ;; Data Maps
 (define-map doctors principal {
@@ -94,6 +100,22 @@
     rating: uint,
     rated-at-block: uint
 })
+
+(define-map subscriptions uint {
+    patient: principal,
+    doctor: principal,
+    frequency-blocks: uint,
+    amount-per-consultation: uint,
+    prepaid-consultations: uint,
+    used-consultations: uint,
+    active: bool,
+    created-at-block: uint,
+    last-payment-block: uint,
+    next-due-block: uint
+})
+
+(define-map patient-subscriptions principal (list 20 uint))
+(define-map doctor-subscriptions principal (list 50 uint))
 
 ;; Public Functions
 
@@ -371,7 +393,8 @@
     {
         total-consultations: (var-get total-consultations),
         total-fees-collected: (var-get total-fees-collected),
-        platform-paused: (var-get platform-paused)
+        platform-paused: (var-get platform-paused),
+        total-subscriptions: (var-get total-subscriptions)
     }
 )
 
@@ -442,5 +465,190 @@
         (min-rating-scaled (* min-rating RATING-SCALE))
     )
         (>= doctor-average min-rating-scaled)
+    )
+)
+
+(define-public (create-subscription (doctor principal) (frequency-blocks uint) (prepaid-consultations uint))
+    (let (
+        (subscription-id (+ (var-get total-subscriptions) u1))
+        (doctor-data (unwrap! (map-get? doctors doctor) ERR-NOT-FOUND))
+        (patient-data (unwrap! (map-get? patients tx-sender) ERR-NOT-FOUND))
+        (consultation-rate (get rate-per-consultation doctor-data))
+        (platform-fee-per-consultation (/ (* consultation-rate PLATFORM-FEE-PERCENT) u100))
+        (total-per-consultation (+ consultation-rate platform-fee-per-consultation))
+        (total-amount (* total-per-consultation prepaid-consultations))
+        (current-patient-subs (default-to (list) (map-get? patient-subscriptions tx-sender)))
+        (current-doctor-subs (default-to (list) (map-get? doctor-subscriptions doctor)))
+    )
+        (asserts! (get active doctor-data) ERR-UNAUTHORIZED)
+        (asserts! (get active patient-data) ERR-UNAUTHORIZED)
+        (asserts! (not (var-get platform-paused)) ERR-UNAUTHORIZED)
+        (asserts! (> frequency-blocks u0) ERR-INVALID-FREQUENCY)
+        (asserts! (> prepaid-consultations u0) ERR-INVALID-AMOUNT)
+        (asserts! (< (len current-patient-subs) u20) ERR-SUBSCRIPTION-EXISTS)
+        (asserts! (< (len current-doctor-subs) u50) ERR-SUBSCRIPTION-EXISTS)
+        
+        (try! (stx-transfer? total-amount tx-sender (as-contract tx-sender)))
+        
+        (map-set subscriptions subscription-id {
+            patient: tx-sender,
+            doctor: doctor,
+            frequency-blocks: frequency-blocks,
+            amount-per-consultation: total-per-consultation,
+            prepaid-consultations: prepaid-consultations,
+            used-consultations: u0,
+            active: true,
+            created-at-block: stacks-block-height,
+            last-payment-block: stacks-block-height,
+            next-due-block: (+ stacks-block-height frequency-blocks)
+        })
+        
+        (map-set patient-subscriptions tx-sender (unwrap! (as-max-len? (append current-patient-subs subscription-id) u20) ERR-SUBSCRIPTION-EXISTS))
+        (map-set doctor-subscriptions doctor (unwrap! (as-max-len? (append current-doctor-subs subscription-id) u50) ERR-SUBSCRIPTION-EXISTS))
+        
+        (var-set total-subscriptions subscription-id)
+        (ok subscription-id)
+    )
+)
+
+(define-public (use-subscription-consultation (subscription-id uint))
+    (let (
+        (subscription (unwrap! (map-get? subscriptions subscription-id) ERR-SUBSCRIPTION-NOT-FOUND))
+        (consultation-id (+ (var-get total-consultations) u1))
+        (patient (get patient subscription))
+        (doctor (get doctor subscription))
+        (doctor-data (unwrap! (map-get? doctors doctor) ERR-NOT-FOUND))
+        (patient-data (unwrap! (map-get? patients patient) ERR-NOT-FOUND))
+    )
+        (asserts! (is-eq tx-sender patient) ERR-UNAUTHORIZED)
+        (asserts! (get active subscription) ERR-SUBSCRIPTION-INACTIVE)
+        (asserts! (< (get used-consultations subscription) (get prepaid-consultations subscription)) ERR-INSUFFICIENT-BALANCE)
+        (asserts! (get active doctor-data) ERR-UNAUTHORIZED)
+        (asserts! (get active patient-data) ERR-UNAUTHORIZED)
+        (asserts! (not (var-get platform-paused)) ERR-UNAUTHORIZED)
+        
+        (map-set consultations consultation-id {
+            patient: patient,
+            doctor: doctor,
+            amount: (- (get amount-per-consultation subscription) (/ (* (get amount-per-consultation subscription) PLATFORM-FEE-PERCENT) (+ u100 PLATFORM-FEE-PERCENT))),
+            platform-fee: (/ (* (get amount-per-consultation subscription) PLATFORM-FEE-PERCENT) (+ u100 PLATFORM-FEE-PERCENT)),
+            status: "booked",
+            created-at-block: stacks-block-height,
+            completed-at-block: none,
+            notes: none
+        })
+        
+        (map-set subscriptions subscription-id (merge subscription {
+            used-consultations: (+ (get used-consultations subscription) u1)
+        }))
+        
+        (var-set total-consultations consultation-id)
+        (ok consultation-id)
+    )
+)
+
+(define-public (renew-subscription (subscription-id uint) (additional-consultations uint))
+    (let (
+        (subscription (unwrap! (map-get? subscriptions subscription-id) ERR-SUBSCRIPTION-NOT-FOUND))
+        (patient (get patient subscription))
+        (doctor (get doctor subscription))
+        (doctor-data (unwrap! (map-get? doctors doctor) ERR-NOT-FOUND))
+        (total-amount (* (get amount-per-consultation subscription) additional-consultations))
+    )
+        (asserts! (is-eq tx-sender patient) ERR-UNAUTHORIZED)
+        (asserts! (get active subscription) ERR-SUBSCRIPTION-INACTIVE)
+        (asserts! (get active doctor-data) ERR-UNAUTHORIZED)
+        (asserts! (> additional-consultations u0) ERR-INVALID-AMOUNT)
+        (asserts! (not (var-get platform-paused)) ERR-UNAUTHORIZED)
+        
+        (try! (stx-transfer? total-amount tx-sender (as-contract tx-sender)))
+        
+        (map-set subscriptions subscription-id (merge subscription {
+            prepaid-consultations: (+ (get prepaid-consultations subscription) additional-consultations),
+            last-payment-block: stacks-block-height,
+            next-due-block: (+ stacks-block-height (get frequency-blocks subscription))
+        }))
+        
+        (ok true)
+    )
+)
+
+(define-public (cancel-subscription (subscription-id uint))
+    (let (
+        (subscription (unwrap! (map-get? subscriptions subscription-id) ERR-SUBSCRIPTION-NOT-FOUND))
+        (patient (get patient subscription))
+        (doctor (get doctor subscription))
+        (remaining-consultations (- (get prepaid-consultations subscription) (get used-consultations subscription)))
+        (refund-amount (* (get amount-per-consultation subscription) remaining-consultations))
+    )
+        (asserts! (or (is-eq tx-sender patient) (is-eq tx-sender doctor)) ERR-UNAUTHORIZED)
+        (asserts! (get active subscription) ERR-SUBSCRIPTION-INACTIVE)
+        (asserts! (not (var-get platform-paused)) ERR-UNAUTHORIZED)
+        
+        (map-set subscriptions subscription-id (merge subscription { active: false }))
+        
+        (if (> refund-amount u0)
+            (try! (as-contract (stx-transfer? refund-amount tx-sender patient)))
+            true
+        )
+        
+        (ok true)
+    )
+)
+
+(define-read-only (get-subscription (subscription-id uint))
+    (map-get? subscriptions subscription-id)
+)
+
+(define-read-only (get-patient-subscriptions (patient principal))
+    (map-get? patient-subscriptions patient)
+)
+
+(define-read-only (get-doctor-subscriptions (doctor principal))
+    (map-get? doctor-subscriptions doctor)
+)
+
+(define-read-only (get-subscription-balance (subscription-id uint))
+    (let (
+        (subscription (map-get? subscriptions subscription-id))
+    )
+        (match subscription
+            some-subscription
+                (some (- (get prepaid-consultations some-subscription) (get used-consultations some-subscription)))
+            none
+        )
+    )
+)
+
+(define-read-only (is-subscription-renewable (subscription-id uint))
+    (let (
+        (subscription (map-get? subscriptions subscription-id))
+    )
+        (match subscription
+            some-subscription
+                (and 
+                    (get active some-subscription)
+                    (<= (get next-due-block some-subscription) stacks-block-height)
+                )
+            false
+        )
+    )
+)
+
+(define-read-only (calculate-subscription-cost (doctor principal) (consultation-count uint))
+    (let (
+        (doctor-data (map-get? doctors doctor))
+    )
+        (match doctor-data
+            some-doctor
+                (let (
+                    (consultation-rate (get rate-per-consultation some-doctor))
+                    (platform-fee-per-consultation (/ (* consultation-rate PLATFORM-FEE-PERCENT) u100))
+                    (total-per-consultation (+ consultation-rate platform-fee-per-consultation))
+                )
+                    (some (* total-per-consultation consultation-count))
+                )
+            none
+        )
     )
 )
