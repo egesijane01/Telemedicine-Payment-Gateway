@@ -187,6 +187,32 @@
     )
 )
 
+(define-public (cancel-consultation (consultation-id uint))
+    (let (
+        (consultation (unwrap! (map-get? consultations consultation-id) ERR-NOT-FOUND))
+        (escrow-data (unwrap! (map-get? escrow consultation-id) ERR-NOT-FOUND))
+        (patient (get patient consultation))
+        (created-block (get created-at-block consultation))
+        (expiration-block (+ created-block CONSULTATION-TIMEOUT-BLOCKS))
+    )
+        (asserts! (is-eq tx-sender patient) ERR-UNAUTHORIZED)
+        (asserts! (is-eq (get status consultation) "booked") ERR-INVALID-STATUS)
+        (asserts! (not (get released escrow-data)) ERR-INVALID-STATUS)
+        (asserts! (not (get dispute-raised escrow-data)) ERR-DISPUTE-EXISTS)
+        (asserts! (<= stacks-block-height expiration-block) ERR-CONSULTATION-EXPIRED)
+        (asserts! (not (var-get platform-paused)) ERR-UNAUTHORIZED)
+        
+        (try! (as-contract (stx-transfer? (get amount escrow-data) tx-sender patient)))
+        
+        (map-set escrow consultation-id (merge escrow-data { released: true }))
+        (map-set consultations consultation-id (merge consultation {
+            status: "cancelled",
+            completed-at-block: (some stacks-block-height)
+        }))
+        (ok true)
+    )
+)
+
 (define-public (start-consultation (consultation-id uint))
     (let (
         (consultation (unwrap! (map-get? consultations consultation-id) ERR-NOT-FOUND))
