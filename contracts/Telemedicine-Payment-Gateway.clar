@@ -22,12 +22,16 @@
 (define-constant ERR-SUBSCRIPTION-INACTIVE (err u115))
 (define-constant ERR-INVALID-FREQUENCY (err u116))
 (define-constant ERR-PAYMENT-NOT-DUE (err u117))
+(define-constant ERR-SELF-REFERRAL (err u118))
+(define-constant ERR-ALREADY-REFERRED (err u119))
+(define-constant ERR-NO-REWARDS (err u120))
 
 ;; Constants
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant PLATFORM-FEE-PERCENT u3)
 (define-constant CONSULTATION-TIMEOUT-BLOCKS u144)
 (define-constant DISPUTE-RESOLUTION-BLOCKS u1008)
+(define-constant REFERRAL-REWARD-PERCENT u5)
 (define-constant MIN-RATING u1)
 (define-constant MAX-RATING u5)
 (define-constant RATING-SCALE u100)
@@ -37,6 +41,7 @@
 (define-data-var total-fees-collected uint u0)
 (define-data-var platform-paused bool false)
 (define-data-var total-subscriptions uint u0)
+(define-data-var total-referrals uint u0)
 
 ;; Data Maps
 (define-map doctors principal {
@@ -116,6 +121,21 @@
 
 (define-map patient-subscriptions principal (list 20 uint))
 (define-map doctor-subscriptions principal (list 50 uint))
+
+(define-map referrals uint {
+    referrer: principal,
+    referred: principal,
+    created-at-block: uint,
+    reward-claimed: bool
+})
+
+(define-map patient-referral-stats principal {
+    total-referrals: uint,
+    reward-balance: uint,
+    total-rewards-claimed: uint
+})
+
+(define-map referred-patients principal bool)
 
 ;; Public Functions
 
@@ -677,4 +697,95 @@
             none
         )
     )
+)
+
+(define-public (refer-patient (referred principal))
+    (let (
+        (referral-id (+ (var-get total-referrals) u1))
+        (referrer-data (unwrap! (map-get? patients tx-sender) ERR-NOT-FOUND))
+        (already-referred (default-to false (map-get? referred-patients referred)))
+        (referrer-stats (default-to { total-referrals: u0, reward-balance: u0, total-rewards-claimed: u0 } (map-get? patient-referral-stats tx-sender)))
+    )
+        (asserts! (not (is-eq tx-sender referred)) ERR-SELF-REFERRAL)
+        (asserts! (not already-referred) ERR-ALREADY-REFERRED)
+        (asserts! (get active referrer-data) ERR-UNAUTHORIZED)
+        (asserts! (not (var-get platform-paused)) ERR-UNAUTHORIZED)
+        
+        (map-set referrals referral-id {
+            referrer: tx-sender,
+            referred: referred,
+            created-at-block: stacks-block-height,
+            reward-claimed: false
+        })
+        
+        (map-set referred-patients referred true)
+        
+        (map-set patient-referral-stats tx-sender (merge referrer-stats {
+            total-referrals: (+ (get total-referrals referrer-stats) u1)
+        }))
+        
+        (var-set total-referrals referral-id)
+        (ok referral-id)
+    )
+)
+
+(define-public (credit-referral-reward (referral-id uint) (consultation-amount uint))
+    (let (
+        (referral (unwrap! (map-get? referrals referral-id) ERR-NOT-FOUND))
+        (referrer (get referrer referral))
+        (referred (get referred referral))
+        (referrer-stats (default-to { total-referrals: u0, reward-balance: u0, total-rewards-claimed: u0 } (map-get? patient-referral-stats referrer)))
+        (reward-amount (/ (* consultation-amount REFERRAL-REWARD-PERCENT) u100))
+    )
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+        (asserts! (not (get reward-claimed referral)) ERR-ALREADY-REFERRED)
+        (asserts! (not (var-get platform-paused)) ERR-UNAUTHORIZED)
+        
+        (map-set referrals referral-id (merge referral { reward-claimed: true }))
+        
+        (map-set patient-referral-stats referrer (merge referrer-stats {
+            reward-balance: (+ (get reward-balance referrer-stats) reward-amount)
+        }))
+        
+        (ok reward-amount)
+    )
+)
+
+(define-public (claim-referral-rewards)
+    (let (
+        (referrer-stats (unwrap! (map-get? patient-referral-stats tx-sender) ERR-NOT-FOUND))
+        (reward-balance (get reward-balance referrer-stats))
+    )
+        (asserts! (> reward-balance u0) ERR-NO-REWARDS)
+        (asserts! (not (var-get platform-paused)) ERR-UNAUTHORIZED)
+        
+        (try! (as-contract (stx-transfer? reward-balance tx-sender tx-sender)))
+        
+        (map-set patient-referral-stats tx-sender (merge referrer-stats {
+            reward-balance: u0,
+            total-rewards-claimed: (+ (get total-rewards-claimed referrer-stats) reward-balance)
+        }))
+        
+        (ok reward-balance)
+    )
+)
+
+(define-read-only (get-referral (referral-id uint))
+    (map-get? referrals referral-id)
+)
+
+(define-read-only (get-patient-referral-stats (patient principal))
+    (map-get? patient-referral-stats patient)
+)
+
+(define-read-only (is-patient-referred (patient principal))
+    (default-to false (map-get? referred-patients patient))
+)
+
+(define-read-only (get-total-referrals)
+    (var-get total-referrals)
+)
+
+(define-read-only (calculate-referral-reward (consultation-amount uint))
+    (/ (* consultation-amount REFERRAL-REWARD-PERCENT) u100)
 )
