@@ -25,6 +25,7 @@
 (define-constant ERR-SELF-REFERRAL (err u118))
 (define-constant ERR-ALREADY-REFERRED (err u119))
 (define-constant ERR-NO-REWARDS (err u120))
+(define-constant ERR-ALREADY-TIPPED (err u121))
 
 ;; Constants
 (define-constant CONTRACT-OWNER tx-sender)
@@ -788,4 +789,60 @@
 
 (define-read-only (calculate-referral-reward (consultation-amount uint))
     (/ (* consultation-amount REFERRAL-REWARD-PERCENT) u100)
+)
+
+(define-map consultation-tips uint {
+    tipper: principal,
+    doctor: principal,
+    amount: uint,
+    tipped-at-block: uint
+})
+
+(define-map doctor-tip-stats principal {
+    total-tips-received: uint,
+    tip-count: uint
+})
+
+(define-public (tip-doctor (consultation-id uint) (amount uint))
+    (let (
+        (consultation (unwrap! (map-get? consultations consultation-id) ERR-NOT-FOUND))
+        (patient (get patient consultation))
+        (doctor (get doctor consultation))
+        (existing-tip (map-get? consultation-tips consultation-id))
+        (current-tip-stats (default-to { total-tips-received: u0, tip-count: u0 } (map-get? doctor-tip-stats doctor)))
+    )
+        (asserts! (is-eq tx-sender patient) ERR-NOT-PATIENT)
+        (asserts! (is-eq (get status consultation) "completed") ERR-NOT-COMPLETED)
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (is-none existing-tip) ERR-ALREADY-TIPPED)
+        (asserts! (not (var-get platform-paused)) ERR-UNAUTHORIZED)
+
+        (try! (stx-transfer? amount tx-sender doctor))
+
+        (map-set consultation-tips consultation-id {
+            tipper: tx-sender,
+            doctor: doctor,
+            amount: amount,
+            tipped-at-block: stacks-block-height
+        })
+
+        (map-set doctor-tip-stats doctor {
+            total-tips-received: (+ (get total-tips-received current-tip-stats) amount),
+            tip-count: (+ (get tip-count current-tip-stats) u1)
+        })
+
+        (ok true)
+    )
+)
+
+(define-read-only (get-consultation-tip (consultation-id uint))
+    (map-get? consultation-tips consultation-id)
+)
+
+(define-read-only (get-doctor-tip-stats (doctor principal))
+    (map-get? doctor-tip-stats doctor)
+)
+
+(define-read-only (has-consultation-been-tipped (consultation-id uint))
+    (is-some (map-get? consultation-tips consultation-id))
 )
